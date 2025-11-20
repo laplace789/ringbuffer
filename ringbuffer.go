@@ -1,40 +1,39 @@
 package ringbuffer
 
 import (
-	"errors"
+	"fmt"
 	"sync/atomic"
-	"unsafe"
 )
 
-// CacheLineSize 預設 64 byte
-const CacheLineSize = 64
+// CacheLineSize is the conservative cache-line separation used on supported targets.
+const CacheLineSize = 128
 
+// Ring is a single-producer, single-consumer ring buffer.
+//
+// A Ring must not be copied after first use. Exactly one producer goroutine may call
+// Set and SetAdv, and exactly one consumer goroutine may call Get and GetAdv. Reset
+// must only be called while both sides are stopped.
 type Ring[T any] struct {
 	// --- Producer Cache Line ---
-	wp       uint64
-	shadowRp uint64                   // Producer 本地緩存的消費者位置
-	_p1      [CacheLineSize - 16]byte // Padding 到 64 bytes
+	wp            uint64
+	shadowRp      uint64                   // Producer 本地緩存的消費者位置
+	writeReserved bool                     // Producer 是否持有可寫 slot
+	_p1           [CacheLineSize - 17]byte // Padding 到 CacheLineSize
 
 	// --- Consumer Cache Line ---
-	rp       uint64
-	shadowWp uint64                   // Consumer 本地緩存的生產者位置
-	_p2      [CacheLineSize - 16]byte // Padding 到 64 bytes
+	rp           uint64
+	shadowWp     uint64                   // Consumer 本地緩存的生產者位置
+	readReserved bool                     // Consumer 是否持有可讀 slot
+	_p2          [CacheLineSize - 17]byte // Padding 到 CacheLineSize
 
 	// --- Shared Read-Only Data ---
-	num  uint64
-	mask uint64
-	data []T
+	noCopy noCopy
+	num    uint64
+	mask   uint64
+	data   []T
 }
 
-var (
-	ErrRingEmpty = errors.New("ring buffer empty")
-	ErrRingFull  = errors.New("ring buffer full")
-)
-
 func roundUpPowerOfTwo(n uint64) uint64 {
-	if n == 0 {
-		return 1
-	}
 	n--
 	n |= n >> 1
 	n |= n >> 2
@@ -46,21 +45,52 @@ func roundUpPowerOfTwo(n uint64) uint64 {
 	return n
 }
 
-func New[T any](num int) *Ring[T] {
-	r := new(Ring[T])
-	r.init(uint64(num))
-	return r
+// New creates a Ring whose capacity is the smallest power of two greater than
+// or equal to num. It returns ErrInvalidCapacity for invalid or unrepresentable
+// capacities and for allocation-size panics.
+func New[T any](num int) (*Ring[T], error) {
+	if num <= 0 {
+		return nil, fmt.Errorf("%w: got %d, must be greater than zero", ErrInvalidCapacity, num)
+	}
+
+	capacity := roundUpPowerOfTwo(uint64(num))
+	maxInt := uint64(^uint(0) >> 1)
+	if capacity == 0 || capacity > maxInt {
+		return nil, fmt.Errorf("%w: %d rounds beyond the maximum int", ErrInvalidCapacity, num)
+	}
+
+	data, err := allocate[T](int(capacity))
+	if err != nil {
+		return nil, err
+	}
+	return &Ring[T]{
+		data: data,
+		num:  capacity,
+		mask: capacity - 1,
+	}, nil
 }
 
-func (r *Ring[T]) init(num uint64) {
-	num = roundUpPowerOfTwo(num)
-	r.data = make([]T, num)
-	r.num = num
-	r.mask = num - 1
+func allocate[T any](capacity int) (data []T, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			data = nil
+			err = fmt.Errorf("%w: cannot allocate capacity %d: %v", ErrInvalidCapacity, capacity, recovered)
+		}
+	}()
+	return make([]T, capacity), nil
 }
 
-// Set 提供可寫 slot。注意：寫入 data 後必須呼叫 SetAdv。
+// Set reserves a writable slot for the producer.
+//
+// From a successful Set until the matching SetAdv, the returned pointer is owned
+// exclusively by the producer. The producer must not retain, read, or write the
+// pointer after SetAdv. Calling Set again before SetAdv returns
+// ErrWriteReservationActive.
 func (r *Ring[T]) Set() (idx uint64, ptr *T, err error) {
+	if r.writeReserved {
+		return 0, nil, ErrWriteReservationActive
+	}
+
 	// 1. 讀取自己的 wp (不需要 atomic，因為只有我在寫)
 	// 但為了配合 atomic.AddUint64 的記憶體模型一致性，使用 Load 也可以，差異極微。
 	wp := atomic.LoadUint64(&r.wp)
@@ -68,6 +98,7 @@ func (r *Ring[T]) Set() (idx uint64, ptr *T, err error) {
 	// 2. 檢查 shadow
 	if wp-r.shadowRp < r.num {
 		idx = wp & r.mask
+		r.writeReserved = true
 		return idx, &r.data[idx], nil
 	}
 
@@ -80,21 +111,39 @@ func (r *Ring[T]) Set() (idx uint64, ptr *T, err error) {
 		return 0, nil, ErrRingFull
 	}
 	idx = wp & r.mask
+	r.writeReserved = true
 	return idx, &r.data[idx], nil
 }
 
-func (r *Ring[T]) SetAdv() {
+// SetAdv publishes the slot reserved by Set to the consumer.
+// After it returns successfully, the producer must no longer access the slot pointer.
+func (r *Ring[T]) SetAdv() error {
+	if !r.writeReserved {
+		return ErrNoWriteReservation
+	}
+	r.writeReserved = false
 	atomic.AddUint64(&r.wp, 1)
+	return nil
 }
 
-// Get 提供可讀 slot。注意：讀取後必須呼叫 GetAdv。
+// Get reserves a readable slot for the consumer.
+//
+// From a successful Get until the matching GetAdv, the returned pointer is owned
+// exclusively by the consumer. The consumer must not retain or dereference the
+// pointer after GetAdv. Calling Get again before GetAdv returns
+// ErrReadReservationActive.
 func (r *Ring[T]) Get() (idx uint64, ptr *T, err error) {
+	if r.readReserved {
+		return 0, nil, ErrReadReservationActive
+	}
+
 	// 1. 讀取自己的 rp
 	rp := atomic.LoadUint64(&r.rp)
 
 	// 2. 檢查 shadow
 	if r.shadowWp > rp {
 		idx = rp & r.mask
+		r.readReserved = true
 		return idx, &r.data[idx], nil
 	}
 
@@ -106,26 +155,36 @@ func (r *Ring[T]) Get() (idx uint64, ptr *T, err error) {
 		return 0, nil, ErrRingEmpty
 	}
 	idx = rp & r.mask
+	r.readReserved = true
 	return idx, &r.data[idx], nil
 }
 
-// GetAdv 推進讀取指標
-func (r *Ring[T]) GetAdv() {
+// GetAdv releases the slot reserved by Get back to the producer.
+// After it returns successfully, the consumer must no longer access the slot pointer.
+func (r *Ring[T]) GetAdv() error {
+	if !r.readReserved {
+		return ErrNoReadReservation
+	}
 	rp := atomic.LoadUint64(&r.rp)
 
 	//清空slot 避免leak
 	var zero T
 	r.data[rp&r.mask] = zero
 
+	r.readReserved = false
 	atomic.AddUint64(&r.rp, 1)
+	return nil
 }
 
-// Reset 非線程安全，請確保無讀寫時呼叫
+// Reset clears all slots, counters, and reservations.
+// It is not concurrency-safe and may only be called while both sides are stopped.
 func (r *Ring[T]) Reset() {
 	atomic.StoreUint64(&r.rp, 0)
 	atomic.StoreUint64(&r.wp, 0)
 	r.shadowRp = 0
 	r.shadowWp = 0
+	r.writeReserved = false
+	r.readReserved = false
 	// Optional: Clear all data to fix leaks on reset
 	var zero T
 	for i := range r.data {
@@ -133,24 +192,7 @@ func (r *Ring[T]) Reset() {
 	}
 }
 
-// Capacity 返回容量
+// Capacity returns the rounded, fixed capacity of the Ring.
 func (r *Ring[T]) Capacity() uint64 {
 	return r.num
-}
-
-// Len 返回目前數量
-func (r *Ring[T]) Len() uint64 {
-	wp := atomic.LoadUint64(&r.wp)
-	rp := atomic.LoadUint64(&r.rp)
-	return wp - rp
-}
-
-// PaddingBytes 用於測試對齊
-func (r *Ring[T]) PaddingBytes() uintptr {
-	wpAddr := uintptr(unsafe.Pointer(&r.wp))
-	rpAddr := uintptr(unsafe.Pointer(&r.rp))
-	if rpAddr > wpAddr {
-		return rpAddr - wpAddr
-	}
-	return wpAddr - rpAddr
 }

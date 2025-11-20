@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  correctness:
+    name: Correctness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.8'
+          cache: true
+      - name: Run short tests
+        run: go test -short ./...
+      - name: Run full tests
+        run: go test ./...
+      - name: Run race detector
+        run: go test -race ./...
+      - name: Run vet
+        run: go vet ./...
+
+  fuzz:
+    name: State-machine fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.8'
+          cache: true
+      - name: Fuzz the ring state machine
+        run: go test -run '^$' -fuzz '^FuzzRingStateMachine$' -fuzztime=10s .
+
+  cross-compile:
+    name: Compile linux/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.8'
+          cache: true
+      - name: Compile tests
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go test -c -o ringbuffer-${{ matrix.goarch }}.test .
+
+  benchmark:
+    name: Benchmark smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.25.8'
+          cache: true
+      - name: Run concurrent SPSC benchmarks
+        run: go test -run '^$' -bench '^BenchmarkSPSCConcurrent$' -benchtime=200ms -benchmem . | tee benchmark.txt
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-${{ github.sha }}
+          path: benchmark.txt
+          retention-days: 30

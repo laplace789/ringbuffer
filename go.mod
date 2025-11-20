@@ -1,3 +1,3 @@
-module ringbuffer
+module github.com/laplace789/ringbuffer
 
-go 1.23.8
+go 1.25.8

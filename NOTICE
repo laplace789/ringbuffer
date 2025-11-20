@@ -1,0 +1,12 @@
+ringbuffer
+
+This project is derived from the ring buffer implementation in goim:
+https://github.com/Terry-Mao/goim/blob/master/internal/comet/ring.go
+
+The original implementation is Copyright (c) 2015 Terry.Mao and licensed
+under the MIT License.
+
+Generic types, lock-free SPSC synchronization, cached shadow indices,
+reservation-state validation, memory clearing, production hardening, tests,
+benchmarks, and documentation were added by laplace789 and are also released
+under the MIT License.

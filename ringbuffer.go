@@ -6,33 +6,31 @@ import (
 	"unsafe"
 )
 
-// 預設 cache line size，若要跨平台用 build tag 改這裡即可
+// CacheLineSize 預設 64 byte
 const CacheLineSize = 64
 
-// 自動 padding 結構
-type cacheLinePad struct {
-	_ [CacheLineSize]byte
-}
-
-// SPSC（單生產單消費）高效環形緩衝區
 type Ring[T any] struct {
-	wp    uint64       // 生產者指標
-	_pad0 cacheLinePad // padding 防止 false sharing
-	rp    uint64       // 消費者指標
-	_pad1 cacheLinePad // padding
+	// --- Producer Cache Line ---
+	wp       uint64
+	shadowRp uint64                   // Producer 本地緩存的消費者位置
+	_p1      [CacheLineSize - 16]byte // Padding 到 64 bytes
 
-	num  uint64 // 必為2的次方
+	// --- Consumer Cache Line ---
+	rp       uint64
+	shadowWp uint64                   // Consumer 本地緩存的生產者位置
+	_p2      [CacheLineSize - 16]byte // Padding 到 64 bytes
+
+	// --- Shared Read-Only Data ---
+	num  uint64
 	mask uint64
 	data []T
 }
 
-// 常見錯誤
 var (
 	ErrRingEmpty = errors.New("ring buffer empty")
 	ErrRingFull  = errors.New("ring buffer full")
 )
 
-// 取最近的2的冪
 func roundUpPowerOfTwo(n uint64) uint64 {
 	if n == 0 {
 		return 1
@@ -48,7 +46,6 @@ func roundUpPowerOfTwo(n uint64) uint64 {
 	return n
 }
 
-// 建構子
 func New[T any](num int) *Ring[T] {
 	r := new(Ring[T])
 	r.init(uint64(num))
@@ -62,10 +59,23 @@ func (r *Ring[T]) init(num uint64) {
 	r.mask = num - 1
 }
 
-// 提供可寫slot指標（Set），寫完請呼叫 SetAdv
+// Set 提供可寫 slot。注意：寫入 data 後必須呼叫 SetAdv。
 func (r *Ring[T]) Set() (idx uint64, ptr *T, err error) {
-	rp := atomic.LoadUint64(&r.rp)
+	// 1. 讀取自己的 wp (不需要 atomic，因為只有我在寫)
+	// 但為了配合 atomic.AddUint64 的記憶體模型一致性，使用 Load 也可以，差異極微。
 	wp := atomic.LoadUint64(&r.wp)
+
+	// 2. 檢查 shadow
+	if wp-r.shadowRp < r.num {
+		idx = wp & r.mask
+		return idx, &r.data[idx], nil
+	}
+
+	// 3. 讀取真正的 rp
+	rp := atomic.LoadUint64(&r.rp)
+	r.shadowRp = rp // Update Shadow
+
+	// 4. 再次檢查
 	if wp-rp >= r.num {
 		return 0, nil, ErrRingFull
 	}
@@ -73,15 +83,25 @@ func (r *Ring[T]) Set() (idx uint64, ptr *T, err error) {
 	return idx, &r.data[idx], nil
 }
 
-// 寫完前進
 func (r *Ring[T]) SetAdv() {
 	atomic.AddUint64(&r.wp, 1)
 }
 
-// 提供可讀slot指標（Get），讀完請呼叫 GetAdv
+// Get 提供可讀 slot。注意：讀取後必須呼叫 GetAdv。
 func (r *Ring[T]) Get() (idx uint64, ptr *T, err error) {
-	wp := atomic.LoadUint64(&r.wp)
+	// 1. 讀取自己的 rp
 	rp := atomic.LoadUint64(&r.rp)
+
+	// 2. 檢查 shadow
+	if r.shadowWp > rp {
+		idx = rp & r.mask
+		return idx, &r.data[idx], nil
+	}
+
+	// 3. 讀取真正的 wp
+	wp := atomic.LoadUint64(&r.wp)
+	r.shadowWp = wp // [FIX] 更新 Shadow，這是原本漏掉的關鍵
+
 	if rp == wp {
 		return 0, nil, ErrRingEmpty
 	}
@@ -89,32 +109,48 @@ func (r *Ring[T]) Get() (idx uint64, ptr *T, err error) {
 	return idx, &r.data[idx], nil
 }
 
-// 讀完前進
+// GetAdv 推進讀取指標
 func (r *Ring[T]) GetAdv() {
+	rp := atomic.LoadUint64(&r.rp)
+
+	//清空slot 避免leak
+	var zero T
+	r.data[rp&r.mask] = zero
+
 	atomic.AddUint64(&r.rp, 1)
 }
 
-// Reset: 重置指標
+// Reset 非線程安全，請確保無讀寫時呼叫
 func (r *Ring[T]) Reset() {
 	atomic.StoreUint64(&r.rp, 0)
 	atomic.StoreUint64(&r.wp, 0)
+	r.shadowRp = 0
+	r.shadowWp = 0
+	// Optional: Clear all data to fix leaks on reset
+	var zero T
+	for i := range r.data {
+		r.data[i] = zero
+	}
 }
 
-// Capacity: 返回容量
+// Capacity 返回容量
 func (r *Ring[T]) Capacity() uint64 {
 	return r.num
 }
 
-// Len: 返回目前數量
+// Len 返回目前數量
 func (r *Ring[T]) Len() uint64 {
 	wp := atomic.LoadUint64(&r.wp)
 	rp := atomic.LoadUint64(&r.rp)
 	return wp - rp
 }
 
-// 確認 padding 是否正確
+// PaddingBytes 用於測試對齊
 func (r *Ring[T]) PaddingBytes() uintptr {
 	wpAddr := uintptr(unsafe.Pointer(&r.wp))
 	rpAddr := uintptr(unsafe.Pointer(&r.rp))
-	return rpAddr - wpAddr
+	if rpAddr > wpAddr {
+		return rpAddr - wpAddr
+	}
+	return wpAddr - rpAddr
 }

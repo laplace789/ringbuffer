@@ -2,7 +2,7 @@
 
 ## Project overview
 
-This repository contains `github.com/laplace789/ringbuffer`, a bounded,
+This repository contains `github.com/laplace789/spsc-ringbuffer`, a bounded,
 generic, lock-free ring buffer for exactly one producer and one consumer
 (SPSC). The supported release scope is Go 1.25.8 on 64-bit `amd64` and
 `arm64`. Other architectures are compile-only, best effort.

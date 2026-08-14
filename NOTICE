@@ -1,4 +1,4 @@
-ringbuffer
+spsc-ringbuffer
 
 This project is derived from the ring buffer implementation in goim:
 https://github.com/Terry-Mao/goim/blob/master/internal/comet/ring.go

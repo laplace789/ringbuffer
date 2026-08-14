@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/laplace789/ringbuffer"
+	"github.com/laplace789/spsc-ringbuffer"
 )
 
 func Example() {

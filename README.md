@@ -1,6 +1,6 @@
-# ringbuffer
+# spsc-ringbuffer
 
-`ringbuffer` 是 Go 1.25.8 的泛型、bounded、lock-free SPSC（Single Producer,
+`spsc-ringbuffer` 是 Go 1.25.8 的泛型、bounded、lock-free SPSC（Single Producer,
 Single Consumer）ring buffer。它使用零拷貝的兩階段 reservation API，適合單一
 producer 與單一 consumer 間的高頻資料傳遞。
 
@@ -15,7 +15,7 @@ producer 與單一 consumer 間的高頻資料傳遞。
 ## 安裝
 
 ```shell
-go get github.com/laplace789/ringbuffer
+go get github.com/laplace789/spsc-ringbuffer
 ```
 
 ## 快速開始
@@ -27,7 +27,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/laplace789/ringbuffer"
+	"github.com/laplace789/spsc-ringbuffer"
 )
 
 func main() {
